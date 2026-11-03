@@ -1,0 +1,16 @@
+build/
+dist/
+target/
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+downloads/
+legacy-python/
+*backup.zip
+source-before-refactor.zip
+
+# Local chat history and recorded voice notes
+p2p_chat_*.db
+p2p_chat_*.db.media/
