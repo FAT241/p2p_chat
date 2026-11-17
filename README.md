@@ -4,10 +4,9 @@
 
 ## Chạy ứng dụng
 
-Yêu cầu JDK 21+ và thư mục `lib/` đi kèm. Mở terminal tại thư mục dự án:
+Yêu cầu JDK 21+, PostgreSQL và thư mục `lib/` đi kèm. Cấu hình PostgreSQL theo mục bên dưới, rồi mở terminal tại thư mục dự án:
 
 ```powershell
-java Build.java test
 java Build.java server
 java Build.java client An
 ```
@@ -25,6 +24,32 @@ Server không có giao diện:
 ```powershell
 java Build.java server --cli --host 0.0.0.0 --port 9000
 ```
+
+## PostgreSQL và pgAdmin 4
+
+1. Mở **pgAdmin 4**, kết nối server PostgreSQL tại 127.0.0.1:5432 bằng tài khoản quản trị đã cài.
+2. Trong **Login/Group Roles → Create → Login/Group Role**, tạo role riêng tên **p2p_chat**, đặt mật khẩu ở **Definition** và bật **Can login?** ở **Privileges**.
+3. Trong **Databases → Create → Database**, tạo database **p2p_chat** và đặt **Owner** là role **p2p_chat**.
+4. Mở PowerShell tại thư mục dự án. Nhập mật khẩu của role ứng dụng rồi chạy client hoặc demo:
+
+    ```powershell
+    $env:P2P_DB_URL = 'jdbc:postgresql://127.0.0.1:5432/p2p_chat'
+    $env:P2P_DB_USER = 'p2p_chat'
+    $env:P2P_DB_PASSWORD = Read-Host 'Mật khẩu PostgreSQL' -MaskInput
+    java Build.java demo6
+    ```
+
+    URL và user trên là mặc định. Các cửa sổ con của lệnh demo nhận cấu hình từ cùng terminal. Nếu demo trên nhiều máy, đặt cấu hình ở mỗi máy chạy client. Dùng PostgreSQL cục bộ trên từng máy hoặc cấu hình địa chỉ PostgreSQL LAN có thể truy cập được.
+
+5. Bật server chat, bấm **Kết nối** ở client và gửi thử tin nhắn. Client tạo các bảng khi kết nối lần đầu. Trong pgAdmin, mở **Query Tool** của database **p2p_chat** và chạy:
+
+    ```sql
+    SELECT id, owner_name, room, sender, type, content, sent_at
+    FROM public.chat_messages
+    ORDER BY id DESC;
+    ```
+
+Bảng **chat_messages** lưu lịch sử theo tên đăng nhập của từng client. Một tin nhắn có thể xuất hiện ở nhiều dòng vì bên gửi và bên nhận giữ lịch sử riêng. **chat_users** lưu danh bạ kết nối. Khi có file lịch sử cũ trên máy client, app nhập vào PostgreSQL một lần theo tên đăng nhập và giữ lại file gốc. WAV vẫn nằm trên máy client trong thư mục .db.media để phát lại.
 
 ## Địa chỉ server và quét LAN
 
@@ -48,11 +73,9 @@ java Build.java server --cli --host 0.0.0.0 --port 9000
 | Webcam/màn hình | Webcam sau khi nhận cuộc gọi video; chia sẻ màn hình chỉ khi bấm nút; không tự bật chia sẻ màn hình khi thiếu webcam |
 | Tắt mic | Ngừng phát tiếng mic, vẫn nhận âm thanh và giữ cổng UDP đã thống nhất |
 | Đính kèm | Thông báo file qua TCP, tải trực tiếp P2P, tiến trình, không ghi đè file có sẵn, dọn file tải dở |
-| Lịch sử | File văn bản UTF-8 `p2p_chat_<tên>.db`, thư mục WAV `.db.media`; có tìm kiếm và đọc lại khi khởi động |
+| Lịch sử | PostgreSQL qua JDBC; xem và truy vấn trong pgAdmin 4; WAV lưu cục bộ để phát lại |
 
 Emoji dùng font có sẵn trên máy (ưu tiên Segoe UI Emoji trên Windows); Java/Swing có thể hiển thị emoji đơn sắc. Các nút chức năng dùng nhãn chữ để không phụ thuộc glyph emoji.
-
-**Lịch sử hiện là định dạng file riêng, không phải SQLite/MySQL hay hệ quản trị CSDL.** Đây là phần lưu trữ bổ sung; đề bài ghi database là điểm cộng. File lịch sử cũ vẫn được đọc. Tin thoại cũ chỉ lưu mô tả mà không có WAV thì không thể khôi phục âm thanh từ mô tả đó.
 
 Mỗi client có một cuộc gọi đang chờ/đang diễn ra. Gọi thoại không mở webcam. Cuộc gọi không được trả lời hết hạn sau khoảng 40 giây. Không có server trung chuyển media/NAT traversal: thiết kế này dành cho các peer truy cập trực tiếp được nhau trong LAN.
 
@@ -65,6 +88,8 @@ Mỗi client có một cuộc gọi đang chờ/đang diễn ra. Gọi thoại k
 
 ## Kiểm thử
 
+Dùng database PostgreSQL riêng cho kiểm thử (ví dụ p2p_chat_test), với cùng cách cấu hình ở trên. Các kiểm thử tạo bảng, ghi và dọn dữ liệu của tài khoản thử nghiệm.
+
 ```powershell
 java Build.java test
 ```
@@ -72,11 +97,11 @@ java Build.java test
 Lệnh này biên dịch lại và chạy:
 
 1. `IntegrationTest`: 20 kiểm tra TCP/file gốc, gồm Unicode, file rỗng/nhị phân, tải bị ngắt, tên trùng và P2P sau khi index server tắt.
-2. `RegressionTest`: 66 kiểm tra mới bằng socket thật: sáu peer, WAV 1/2/5/120/300 giây, gói thoại thiếu/quá lớn, thương lượng và đóng cuộc gọi, audio mẫu/video sinh tự động hai chiều, multicast dài, sáu bộ nhận broadcast, discovery và lịch sử.
+2. `RegressionTest`: 68 kiểm tra bằng socket thật và PostgreSQL: sáu peer, WAV 1/2/5/120/300 giây, gói thoại thiếu/quá lớn, thương lượng và đóng cuộc gọi, audio mẫu/video sinh tự động hai chiều, multicast dài, sáu bộ nhận broadcast, discovery, nhập lịch sử cũ và đọc lại dữ liệu PostgreSQL.
 3. `UiRegressionTest`: thao tác Swing trên EDT, kết nối hai client, lọc phòng, chống lặp TCP/UDP, gửi multicast khi server là loopback, emoji/chèn/xóa cụm, tên có dấu cách, hủy cuộc gọi và ngắt kết nối.
 4. Smoke test khởi tạo cửa sổ client/server.
 
-Ảnh giao diện phục vụ kiểm tra được tạo tại `build/qa/chat-window.png` và `build/qa/emoji-picker.png`. Kiểm thử dùng dữ liệu tạm riêng, không xóa lịch sử người dùng.
+Ảnh giao diện phục vụ kiểm tra được tạo tại `build/qa/chat-window.png` và `build/qa/emoji-picker.png`. Kiểm thử dùng tên tài khoản ngẫu nhiên và dữ liệu WAV tạm riêng.
 
 **Phạm vi đã kiểm tra:** nhiều peer trên cùng máy, socket thật, media dùng dữ liệu mẫu. Việc mic/loa/webcam hoạt động và kết nối qua các máy vật lý phải được xác nhận trên thiết bị/mạng dùng để demo.
 

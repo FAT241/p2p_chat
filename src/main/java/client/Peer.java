@@ -199,6 +199,10 @@ public final class Peer implements AutoCloseable {
             socket.setSoTimeout(60_000);
             if (closed) throw new IOException("Phiên đã đóng");
             return socket;
+        } catch (SocketTimeoutException ex) {
+            socket.close(); transfers.remove(socket);
+            throw new IOException("Hết thời gian kết nối P2P tới " + endpoint.get("ip") + ":" + endpoint.get("port")
+                + ". Kiểm tra máy nhận còn online, IP cùng mạng và quyền Java qua tường lửa trên máy nhận.", ex);
         } catch (IOException | RuntimeException ex) { socket.close(); transfers.remove(socket); throw ex; }
     }
 

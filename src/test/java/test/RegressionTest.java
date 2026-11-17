@@ -200,14 +200,21 @@ public final class RegressionTest {
         check(labeled.networkPriority()<new NetworkSupport.ServerAddress("127.0.0.1",9000,"PC","Cùng máy (localhost)").networkPriority(),"Wi-Fi sorted ahead of localhost for LAN demo");
     }
     private static void history(Path folder) throws Exception {
-        var file=folder.resolve("history.db");var db=new ChatDatabase(file);
+        System.setProperty("p2p.data.dir",folder.toString());
+        String owner="history-test-"+UUID.randomUUID();
+        var file=folder.resolve("p2p_chat_"+owner+".db");
+        Files.writeString(file,"MSG|1|room|An|text|Tin cũ 😀||0|2026-01-01 12:00:00\n");
+        var db=ChatDatabase.defaultInstance(owner);
+        check(db.allMessages().getFirst().content().equals("Tin cũ 😀"),"legacy history imported into PostgreSQL");
         String body="C:\\new\\path | 😀❤️👩‍💻\nTiếng Việt";
         db.recordMessage("room","An | Bình","text",body,"",0);db.recordUser("An | Bình","127.0.0.1",9000);
         byte[] wav=AudioService.pcmToWav(new byte[160000],AudioService.FORMAT);String voice=db.saveVoice(wav);
         db.recordMessage("room","An","voice","5 seconds",voice,wav.length);
-        var loaded=new ChatDatabase(file);
-        check(loaded.allMessages().getFirst().content().equals(body),"history preserves literal escapes and emoji after reload");
+        var loaded=ChatDatabase.defaultInstance(owner);
+        check(loaded.allMessages().size()==3 && loaded.allMessages().get(1).content().equals(body),"history preserves literal escapes and emoji after reload");
         check(loaded.allUsers().containsKey("An | Bình"),"user name unescaped on reload");
-        check(Arrays.equals(wav,loaded.readVoice(loaded.allMessages().get(1).attachmentName())),"voice note replay data persists after restart");
+        check(Arrays.equals(wav,loaded.readVoice(loaded.allMessages().get(2).attachmentName())),"voice note replay data persists after restart");
+        loaded.clear();
+        check(ChatDatabase.defaultInstance(owner).allMessages().isEmpty(),"cleared history is not reimported");
     }
 }

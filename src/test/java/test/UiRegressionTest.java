@@ -53,7 +53,8 @@ public final class UiRegressionTest {
         ClientWindow first=null,second=null;
         try(var server=new IndexServer("127.0.0.1",0,s->{});var sender=new Peer(new Peer.Events(){public void chat(String r,String s,String t){}public void status(String t){}});var udp=new UdpService()) {
             sender.connect("127.0.0.1",server.port(),"An Bình");sender.call("join","room","Phòng kiểm tra");
-            first=edt(()->new ClientWindow("Người nhận"));second=edt(()->new ClientWindow("Ngoài phòng"));
+            String suffix=UUID.randomUUID().toString().substring(0,8);
+            first=edt(()->new ClientWindow("Người nhận "+suffix));second=edt(()->new ClientWindow("Ngoài phòng "+suffix));
             ClientWindow a=first,b=second;
             edt(()->{for(var ui:List.of(a,b)){
                 ((JTextField)field(ui,"port")).setText(""+server.port());ui.addNotify();ui.validate();invoke(ui,"toggleConnection");
@@ -125,6 +126,10 @@ public final class UiRegressionTest {
             ClientWindow a=first,b=second;
             edt(()->{if(a!=null)a.dispose();if(b!=null)b.dispose();return null;});
             edt(()->null);
+            for (var window : new ClientWindow[]{a,b}) {
+                ChatDatabase db = window == null ? null : field(window,"database");
+                if (db != null) db.clear();
+            }
             try(var files=Files.walk(temp)){for(var file:files.sorted(Comparator.reverseOrder()).toList())Files.delete(file);}
         }
     }

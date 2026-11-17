@@ -1,184 +1,232 @@
 package common;
 
-import java.io.*;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
+import java.sql.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Cơ sở dữ liệu lưu trữ lịch sử tin nhắn, danh bạ người dùng và phòng chat.
- * Tự động tạo và lưu trữ bền vững vào file database (chat_history.db).
- */
+/** Lịch sử theo người dùng, lưu trong PostgreSQL. */
 public final class ChatDatabase {
-    public record MessageRecord(
-        long id,
-        String room,
-        String sender,
-        String type,           // "text", "voice", "file", "broadcast", "video"
-        String content,
-        String attachmentName,
-        long attachmentSize,
-        String timestamp
-    ) {}
-
+    public record MessageRecord(long id, String room, String sender, String type, String content,
+                                String attachmentName, long attachmentSize, String timestamp) {}
     public record UserRecord(String username, String ip, int port, String lastSeen) {}
 
-    private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private final Path dbFile;
-    private final List<MessageRecord> messages = new ArrayList<>();
-    private final Map<String, UserRecord> users = new ConcurrentHashMap<>();
-    private final Set<String> rooms = ConcurrentHashMap.newKeySet();
-    private final AtomicLong nextId = new AtomicLong(1);
+    public static final class StorageException extends RuntimeException {
+        private StorageException(Exception cause) {
+            super("Lỗi PostgreSQL: " + cause.getMessage(), cause);
+        }
+    }
 
-    public ChatDatabase(Path dbFile) {
-        this.dbFile = dbFile.toAbsolutePath().normalize();
-        load();
+    private final String owner;
+    private final Path legacyFile;
+
+    private ChatDatabase(String owner, Path legacyFile) {
+        this.owner = owner;
+        this.legacyFile = legacyFile;
+        initialize();
     }
 
     public static ChatDatabase defaultInstance(String scope) {
         String name = scope == null || scope.isBlank() ? "common" : scope.trim();
         String safe = name.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_");
         if (!safe.equals(name)) safe += "_" + Integer.toHexString(name.hashCode());
-        return new ChatDatabase(Path.of(System.getProperty("p2p.data.dir", "."), "p2p_chat_" + safe + ".db"));
+        return new ChatDatabase(name, Path.of(System.getProperty("p2p.data.dir", "."), "p2p_chat_" + safe + ".db"));
     }
 
-    private synchronized void load() {
-        if (!Files.exists(dbFile)) return;
-        try (var reader = Files.newBufferedReader(dbFile, StandardCharsets.UTF_8)) {
+    private static Connection connect() throws SQLException {
+        String url = System.getenv().getOrDefault("P2P_DB_URL", "jdbc:postgresql://127.0.0.1:5432/p2p_chat");
+        var properties = new Properties();
+        properties.setProperty("user", System.getenv().getOrDefault("P2P_DB_USER", "p2p_chat"));
+        properties.setProperty("password", System.getenv().getOrDefault("P2P_DB_PASSWORD", ""));
+        properties.setProperty("connectTimeout", "3");
+        properties.setProperty("socketTimeout", "5");
+        return DriverManager.getConnection(url, properties);
+    }
+
+    private void initialize() {
+        try (var connection = connect(); var statement = connection.createStatement()) {
+            connection.setAutoCommit(false);
+            // Serialize schema creation when several demo clients connect together.
+            statement.execute("SELECT pg_advisory_xact_lock(192773241)");
+            statement.execute("""
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    owner_name text NOT NULL, room text NOT NULL, sender text NOT NULL,
+                    type text NOT NULL, content text NOT NULL, attachment_name text NOT NULL,
+                    attachment_size bigint NOT NULL, sent_at timestamp NOT NULL DEFAULT localtimestamp
+                )
+                """);
+            statement.execute("CREATE INDEX IF NOT EXISTS chat_messages_owner_id ON chat_messages (owner_name, id)");
+            statement.execute("""
+                CREATE TABLE IF NOT EXISTS chat_users (
+                    owner_name text NOT NULL, username text NOT NULL, ip text NOT NULL,
+                    port integer NOT NULL, last_seen timestamp NOT NULL DEFAULT localtimestamp,
+                    PRIMARY KEY (owner_name, username)
+                )
+                """);
+            statement.execute("CREATE TABLE IF NOT EXISTS chat_imports (owner_name text PRIMARY KEY)");
+            importLegacy(connection);
+            connection.commit();
+        } catch (SQLException | IOException | NumberFormatException ex) {
+            throw new StorageException(ex);
+        }
+    }
+
+    private void importLegacy(Connection connection) throws SQLException, IOException {
+        if (!Files.isRegularFile(legacyFile)) return;
+        try (var marker = prepare(connection, "INSERT INTO chat_imports VALUES (?) ON CONFLICT DO NOTHING", owner)) {
+            if (marker.executeUpdate() == 0) return;
+        }
+        try (var reader = Files.newBufferedReader(legacyFile, StandardCharsets.UTF_8)) {
             String line;
             while ((line = reader.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty() || line.startsWith("#")) continue;
-                String[] parts = line.split("\\|", -1);
-                if (parts.length >= 8 && "MSG".equals(parts[0])) {
-                    long id = Long.parseLong(parts[1]);
-                    if (id >= nextId.get()) nextId.set(id + 1);
-                    String room = unescape(parts[2]);
-                    String sender = unescape(parts[3]);
-                    String type = unescape(parts[4]);
-                    String content = unescape(parts[5]);
-                    String attName = unescape(parts[6]);
-                    long attSize = Long.parseLong(parts[7]);
-                    String time = parts.length > 8 ? parts[8] : "";
-                    messages.add(new MessageRecord(id, room, sender, type, content, attName, attSize, time));
-                    rooms.add(room);
-                } else if (parts.length >= 5 && "USER".equals(parts[0])) {
-                    String user = unescape(parts[1]);
-                    users.put(user, new UserRecord(user, parts[2], Integer.parseInt(parts[3]), parts[4]));
+                String[] fields = line.split("\\|", -1);
+                if (fields.length >= 8 && "MSG".equals(fields[0])) {
+                    try (var insert = prepare(connection, """
+                        INSERT INTO chat_messages (owner_name, room, sender, type, content, attachment_name, attachment_size, sent_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, '')::timestamp, localtimestamp))
+                        """, owner, unescape(fields[2]), unescape(fields[3]), unescape(fields[4]),
+                        unescape(fields[5]), unescape(fields[6]), Long.parseLong(fields[7]),
+                        fields.length > 8 ? fields[8] : "")) {
+                        insert.executeUpdate();
+                    }
+                } else if (fields.length >= 5 && "USER".equals(fields[0])) {
+                    try (var insert = prepare(connection, UPSERT_USER, owner, unescape(fields[1]), fields[2],
+                        Integer.parseInt(fields[3]), fields[4])) {
+                        insert.executeUpdate();
+                    }
                 }
             }
-        } catch (Exception ex) {
-            System.err.println("Lỗi đọc database: " + ex.getMessage());
         }
     }
 
-    private synchronized void append(String line) {
-        try {
-            if (dbFile.getParent() != null) Files.createDirectories(dbFile.getParent());
-            Files.writeString(dbFile, line + System.lineSeparator(), StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-        } catch (IOException ex) {
-            System.err.println("Lỗi ghi database: " + ex.getMessage());
-        }
+    private static final String UPSERT_USER = """
+        INSERT INTO chat_users (owner_name, username, ip, port, last_seen)
+        VALUES (?, ?, ?, ?, COALESCE(NULLIF(?, '')::timestamp, localtimestamp))
+        ON CONFLICT (owner_name, username) DO UPDATE SET
+            ip = EXCLUDED.ip, port = EXCLUDED.port, last_seen = EXCLUDED.last_seen
+        """;
+
+    public void recordMessage(String room, String sender, String type, String content,
+                              String attachmentName, long attachmentSize) {
+        update("""
+            INSERT INTO chat_messages (owner_name, room, sender, type, content, attachment_name, attachment_size)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, owner, room, sender, type, content, attachmentName == null ? "" : attachmentName, attachmentSize);
     }
 
-    public synchronized MessageRecord recordMessage(String room, String sender, String type, String content,
-                                                   String attachmentName, long attachmentSize) {
-        long id = nextId.getAndIncrement();
-        String time = LocalDateTime.now().format(TIME_FORMAT);
-        var record = new MessageRecord(id, room, sender, type, content,
-            attachmentName == null ? "" : attachmentName, attachmentSize, time);
-        messages.add(record);
-        rooms.add(room);
-
-        String line = String.format("MSG|%d|%s|%s|%s|%s|%s|%d|%s",
-            id, escape(room), escape(sender), escape(type), escape(content),
-            escape(attachmentName == null ? "" : attachmentName), attachmentSize, time);
-        append(line);
-        return record;
+    public void recordUser(String username, String ip, int port) {
+        update(UPSERT_USER, owner, username, ip, port, "");
     }
 
-    public synchronized void recordUser(String username, String ip, int port) {
-        String time = LocalDateTime.now().format(TIME_FORMAT);
-        users.put(username, new UserRecord(username, ip, port, time));
-        append(String.format("USER|%s|%s|%d|%s", escape(username), ip, port, time));
+    public List<MessageRecord> getRecentMessages(String room, int limit) {
+        var result = readMessages("""
+            AND (CAST(? AS text) IS NULL OR room = ? OR type = 'broadcast')
+            ORDER BY id DESC LIMIT ?
+            """, room, room, limit);
+        return result.reversed();
     }
 
-    public synchronized List<MessageRecord> getRecentMessages(String room, int limit) {
-        var result = new ArrayList<MessageRecord>();
-        for (var msg : messages) {
-            if (room == null || room.equals(msg.room()) || "broadcast".equals(msg.type())) {
-                result.add(msg);
+    public List<MessageRecord> search(String query) {
+        if (query == null || query.isBlank()) return allMessages();
+        // Keep Java's Unicode case matching and literal substring semantics.
+        String term = query.toLowerCase(Locale.ROOT);
+        return allMessages().stream().filter(msg -> msg.content().toLowerCase(Locale.ROOT).contains(term)
+            || msg.sender().toLowerCase(Locale.ROOT).contains(term)
+            || msg.attachmentName().toLowerCase(Locale.ROOT).contains(term)).toList();
+    }
+
+    public List<MessageRecord> allMessages() {
+        return readMessages("ORDER BY id");
+    }
+
+    private List<MessageRecord> readMessages(String clause, Object... filters) {
+        try (var connection = connect(); var statement = connection.prepareStatement("""
+            SELECT id, room, sender, type, content, attachment_name, attachment_size,
+                to_char(sent_at, 'YYYY-MM-DD HH24:MI:SS')
+            FROM chat_messages WHERE owner_name = ?
+            """ + clause)) {
+            statement.setString(1, owner);
+            for (int i = 0; i < filters.length; i++) statement.setObject(i + 2, filters[i]);
+            var messages = new ArrayList<MessageRecord>();
+            try (var rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    messages.add(new MessageRecord(rows.getLong(1), rows.getString(2), rows.getString(3),
+                        rows.getString(4), rows.getString(5), rows.getString(6), rows.getLong(7), rows.getString(8)));
+                }
             }
+            return messages;
+        } catch (SQLException ex) {
+            throw new StorageException(ex);
         }
-        if (result.size() > limit) {
-            return new ArrayList<>(result.subList(result.size() - limit, result.size()));
-        }
-        return result;
     }
 
-    public synchronized List<MessageRecord> search(String query) {
-        if (query == null || query.isBlank()) return List.copyOf(messages);
-        String q = query.toLowerCase(Locale.ROOT);
-        var result = new ArrayList<MessageRecord>();
-        for (var msg : messages) {
-            if (msg.content().toLowerCase(Locale.ROOT).contains(q) ||
-                msg.sender().toLowerCase(Locale.ROOT).contains(q) ||
-                msg.attachmentName().toLowerCase(Locale.ROOT).contains(q)) {
-                result.add(msg);
+    public Map<String, UserRecord> allUsers() {
+        try (var connection = connect(); var statement = prepare(connection, """
+            SELECT username, ip, port, to_char(last_seen, 'YYYY-MM-DD HH24:MI:SS')
+            FROM chat_users WHERE owner_name = ?
+            """, owner); var rows = statement.executeQuery()) {
+            var users = new HashMap<String, UserRecord>();
+            while (rows.next()) {
+                users.put(rows.getString(1), new UserRecord(rows.getString(1), rows.getString(2), rows.getInt(3), rows.getString(4)));
             }
+            return users;
+        } catch (SQLException ex) {
+            throw new StorageException(ex);
         }
-        return result;
     }
 
-    public synchronized List<MessageRecord> allMessages() {
-        return List.copyOf(messages);
+    public void clear() {
+        try (var connection = connect();
+             var messages = prepare(connection, "DELETE FROM chat_messages WHERE owner_name = ?", owner);
+             var users = prepare(connection, "DELETE FROM chat_users WHERE owner_name = ?", owner)) {
+            connection.setAutoCommit(false);
+            messages.executeUpdate();
+            users.executeUpdate();
+            connection.commit();
+        } catch (SQLException ex) {
+            throw new StorageException(ex);
+        }
     }
 
-    public synchronized Map<String, UserRecord> allUsers() {
-        return Map.copyOf(users);
+    private void update(String sql, Object... values) {
+        try (var connection = connect(); var statement = prepare(connection, sql, values)) {
+            statement.executeUpdate();
+        } catch (SQLException ex) {
+            throw new StorageException(ex);
+        }
     }
 
-    public synchronized Set<String> allRooms() {
-        return Set.copyOf(rooms);
-    }
-
-    public synchronized void clear() {
-        messages.clear();
-        users.clear();
-        rooms.clear();
+    private static PreparedStatement prepare(Connection connection, String sql, Object... values) throws SQLException {
+        var statement = connection.prepareStatement(sql);
         try {
-            Files.deleteIfExists(dbFile);
-        } catch (IOException ignored) {}
+            for (int i = 0; i < values.length; i++) statement.setObject(i + 1, values[i]);
+            return statement;
+        } catch (SQLException ex) {
+            statement.close();
+            throw ex;
+        }
     }
 
-    public Path getDbFile() {
-        return dbFile;
+    private Path voiceFolder() {
+        return legacyFile.resolveSibling(legacyFile.getFileName() + ".media");
     }
 
     public String saveVoice(byte[] wav) throws IOException {
-        Path folder = dbFile.resolveSibling(dbFile.getFileName() + ".media");
+        Path folder = voiceFolder();
         Files.createDirectories(folder);
         String name = UUID.randomUUID() + ".wav";
         Files.write(folder.resolve(name), wav, StandardOpenOption.CREATE_NEW);
         return name;
     }
+
     public byte[] readVoice(String name) throws IOException {
         if (name == null || !name.matches("[a-fA-F0-9-]{36}\\.wav")) throw new IOException("Không có dữ liệu âm thanh đã lưu");
-        Path file = dbFile.resolveSibling(dbFile.getFileName() + ".media").resolve(name);
+        Path file = voiceFolder().resolve(name);
         if (Files.size(file) > Protocol.MAX_VOICE_BYTES) throw new IOException("File âm thanh quá lớn");
         return Files.readAllBytes(file);
     }
-
-    private static String escape(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("|", "\\p").replace("\n", "\\n").replace("\r", "\\r");
-    }
-
     private static String unescape(String s) {
         if (s == null) return "";
         var result = new StringBuilder();

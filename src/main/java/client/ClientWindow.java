@@ -113,7 +113,6 @@ public final class ClientWindow extends JFrame {
             username.setText(initialName.trim());
         }
 
-        database = ChatDatabase.defaultInstance("local");
 
         // Top Header
         var top = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 8));
@@ -318,8 +317,8 @@ public final class ClientWindow extends JFrame {
         var btnSearchDb = button("Tìm kiếm", this::refreshDatabaseTable);
         var btnReloadDb = button("Tải lại toàn bộ", () -> { dbSearchField.setText(""); refreshDatabaseTable(); });
         var btnClearDb = button("Xóa sạch DB", () -> {
-            if (JOptionPane.showConfirmDialog(this, "Bạn có chắc muốn xóa lịch sử DB?", "Xác nhận", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION) {
-                database.clear();
+            if (database != null && JOptionPane.showConfirmDialog(this, "Bạn có chắc muốn xóa lịch sử DB?", "Xác nhận", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION) {
+                saveHistory(database::clear);
                 refreshDatabaseTable();
             }
         });
@@ -330,16 +329,19 @@ public final class ClientWindow extends JFrame {
         panel.add(top, BorderLayout.NORTH);
 
         panel.add(new JScrollPane(dbTable), BorderLayout.CENTER);
-        databasePath.setText("Tập tin lịch sử: " + database.getDbFile());
+        databasePath.setText(database == null ? "PostgreSQL · Hãy kết nối để tải lịch sử" : "PostgreSQL · Lịch sử tin nhắn");
         panel.add(databasePath, BorderLayout.SOUTH);
         return panel;
     }
 
     private void refreshDatabaseTable() {
-        databasePath.setText("Tập tin lịch sử: " + database.getDbFile());
+        databasePath.setText(database == null ? "PostgreSQL · Hãy kết nối để tải lịch sử" : "PostgreSQL · Lịch sử tin nhắn");
         dbTableModel.setRowCount(0);
+        if (database == null) return;
         String query = dbSearchField.getText().strip();
-        var list = query.isEmpty() ? database.allMessages() : database.search(query);
+        List<ChatDatabase.MessageRecord> list;
+        try { list = query.isEmpty() ? database.allMessages() : database.search(query); }
+        catch (ChatDatabase.StorageException ex) { status.setText(ex.getMessage()); return; }
         for (var msg : list) {
             dbTableModel.addRow(new Object[]{
                 msg.id(), msg.room(), msg.sender(), msg.type(), msg.content(),
@@ -347,6 +349,11 @@ public final class ClientWindow extends JFrame {
                 msg.timestamp()
             });
         }
+    }
+
+    private void saveHistory(Runnable write) {
+        try { write.run(); }
+        catch (ChatDatabase.StorageException ex) { status.setText(ex.getMessage()); }
     }
 
     private static JButton button(String label, Runnable action) {
@@ -422,14 +429,14 @@ public final class ClientWindow extends JFrame {
             if ("broadcast".equals(type)) { receiveBroadcast(msg.get("id"), sender, text); return; }
             String room = msg.get("room");
             if (!"multicast".equals(type) || room == null || !addresses.containsKey(room) || !remember(msg.get("id"))) return;
-            database.recordMessage(room, sender, "multicast", text, "", 0);
+            saveHistory(() -> database.recordMessage(room, sender, "multicast", text, "", 0));
             appendMessage(room, sender, text, "multicast", null, 0);
             refreshDatabaseTable();
         });
     }
     private void receiveBroadcast(String id, String sender, String text) {
         if (!remember(id)) return;
-        database.recordMessage("BROADCAST", sender, "broadcast", text, "", 0);
+        saveHistory(() -> database.recordMessage("BROADCAST", sender, "broadcast", text, "", 0));
         appendMessage("BROADCAST", sender, text, "broadcast", null, 0);
         refreshDatabaseTable();
     }
@@ -462,7 +469,8 @@ public final class ClientWindow extends JFrame {
         session++;
         int generation = session;
 
-        database = ChatDatabase.defaultInstance(name);
+        try { database = ChatDatabase.defaultInstance(name); }
+        catch (ChatDatabase.StorageException ex) { status.setText(ex.getMessage()); return; }
         ChatDatabase sessionDatabase = database;
         refreshDatabaseTable();
 
@@ -471,7 +479,7 @@ public final class ClientWindow extends JFrame {
                 SwingUtilities.invokeLater(() -> {
                     if (generation == session) {
                         appendMessage(room, sender, text, "text", null, 0);
-                        database.recordMessage(room, sender, "text", text, "", 0);
+                        saveHistory(() -> database.recordMessage(room, sender, "text", text, "", 0));
                         refreshDatabaseTable();
                     }
                 });
@@ -484,7 +492,7 @@ public final class ClientWindow extends JFrame {
                     if (generation == session) {
                         String text = "Tin nhắn thoại " + String.format(Locale.ROOT, "%.1f", (wavData.length - 44) / 32000.0) + " giây";
                         appendMessage(room, sender, text, "voice", file, wavData.length);
-                        database.recordMessage(room, sender, "voice", text, file, wavData.length);
+                        saveHistory(() -> database.recordMessage(room, sender, "voice", text, file, wavData.length));
                         refreshDatabaseTable();
                     }
                 });
@@ -493,7 +501,7 @@ public final class ClientWindow extends JFrame {
                 SwingUtilities.invokeLater(() -> {
                     if (generation == session) {
                         appendMessage(room, sender, "Đã gửi đính kèm file: " + filename + " (" + (size / 1024) + " KB)", "file", filename, size);
-                        database.recordMessage(room, sender, "file", filename, filename, size);
+                        saveHistory(() -> database.recordMessage(room, sender, "file", filename, filename, size));
                         refreshDatabaseTable();
                         promptDownloadAttachment(sender, filename, size, ip, peerPort);
                     }
@@ -529,7 +537,7 @@ public final class ClientWindow extends JFrame {
             host.setEnabled(false); port.setEnabled(false); username.setEnabled(false); btnAutoDiscover.setEnabled(false);
             try { udpService.setNetworkInterface(NetworkInterface.getByInetAddress(candidate.localAddress())); }
             catch (SocketException ex) { status.setText("Không chọn được card mạng multicast: " + ex.getMessage()); }
-            database.recordUser(name, candidate.localAddress().getHostAddress(), candidate.port());
+            saveHistory(() -> database.recordUser(name, candidate.localAddress().getHostAddress(), candidate.port()));
             refresh();
         }, () -> connect.setEnabled(true));
     }
@@ -627,7 +635,9 @@ public final class ClientWindow extends JFrame {
         String selected = room();
         if (selected != null) {
             // Tải lại lịch sử gần đây từ database
-            var recent = database.getRecentMessages(selected, 25);
+            List<ChatDatabase.MessageRecord> recent;
+            try { recent = database.getRecentMessages(selected, 25); }
+            catch (ChatDatabase.StorageException ex) { status.setText(ex.getMessage()); return; }
             for (var msg : recent) {
                 appendMessage(msg.room(), msg.sender(), msg.content(), msg.type(), msg.attachmentName(), msg.attachmentSize());
             }
@@ -644,7 +654,7 @@ public final class ClientWindow extends JFrame {
         message.setText("");
 
         appendMessage(selected, "Tôi", text, "text", null, 0);
-        database.recordMessage(selected, active.name(), "text", text, "", 0);
+        saveHistory(() -> database.recordMessage(selected, active.name(), "text", text, "", 0));
         refreshDatabaseTable();
 
         if (chkMulticastUdp.isSelected()) {
@@ -696,16 +706,23 @@ public final class ClientWindow extends JFrame {
             byte[] wav = audioService.stopRecording();
             if (wav.length <= 44) throw new java.io.IOException("Chưa có dữ liệu ghi âm");
             if (active != peer || !connected) throw new java.io.IOException("Phiên ghi âm đã ngắt kết nối");
+            String file = history.saveVoice(wav);
+            // A recipient may have reconnected on a different port while we were recording.
+            List<Map<String, String>> currentRecipients = recipients;
+            try { currentRecipients = Protocol.rows(active.call("members", "room", selected)); }
+            catch (java.io.IOException ignored) { /* Retain offline P2P support with cached endpoints. */ }
             var failed = new ArrayList<String>(); int sent = 0;
-            for (var recipient : recipients) if (!active.name().equals(recipient.get("name"))) {
+            for (var recipient : currentRecipients) if (!active.name().equals(recipient.get("name"))) {
                 try { active.sendVoice(recipient, selected, wav); sent++; }
                 catch (Exception ex) { failed.add(recipient.get("name") + ": " + ex.getMessage()); }
             }
-            if (sent == 0) throw new java.io.IOException(failed.isEmpty() ? "Không có người nhận trong phòng" : String.join("; ", failed));
             String info = "Tin nhắn thoại " + String.format(java.util.Locale.ROOT, "%.1f", (wav.length - 44) / 32000.0) + " giây";
-            return new VoiceResult(info, failed.isEmpty() ? "Đã gửi tin nhắn thoại" : "Gửi chưa đủ: " + String.join("; ", failed), history.saveVoice(wav), wav.length);
+            String delivery = sent == 0 ? "Đã lưu bản ghi trên máy; chưa gửi được. "
+                + (failed.isEmpty() ? "Không có người nhận trong phòng." : String.join("; ", failed))
+                : failed.isEmpty() ? "Đã gửi tin nhắn thoại" : "Gửi chưa đủ: " + String.join("; ", failed);
+            return new VoiceResult(info, delivery, file, wav.length);
         }, result -> {
-            database.recordMessage(selected, active.name(), "voice", result.text(), result.file(), result.size());
+            saveHistory(() -> database.recordMessage(selected, active.name(), "voice", result.text(), result.file(), result.size()));
             appendMessage(selected, "Tôi", result.text(), "voice", result.file(), result.size());
             status.setText(result.status()); refreshDatabaseTable();
         }, () -> { btnVoice.setEnabled(true); btnVoice.setText("Ghi âm"); });
@@ -726,7 +743,7 @@ public final class ClientWindow extends JFrame {
             for (var r : recipients) if (!active.name().equals(r.get("name"))) {
                 active.sendAttachmentAnnounce(r, selected, path.getFileName().toString(), size, active.port());
             }
-            database.recordMessage(selected, active.name(), "file", path.getFileName().toString(), path.getFileName().toString(), size);
+            saveHistory(() -> database.recordMessage(selected, active.name(), "file", path.getFileName().toString(), path.getFileName().toString(), size));
             return path;
         }, p -> {
             appendMessage(selected, "Tôi", "Đã đính kèm file: " + p.getFileName(), "file", p.getFileName().toString(), 0);
@@ -754,7 +771,7 @@ public final class ClientWindow extends JFrame {
             } catch (Exception ex) { failures.add("Danh bạ/TCP: " + ex.getMessage()); }
             return failures;
         }, failures -> {
-            database.recordMessage("BROADCAST", active.name(), "broadcast", text, "", 0);
+            saveHistory(() -> database.recordMessage("BROADCAST", active.name(), "broadcast", text, "", 0));
             appendMessage("BROADCAST", active.name(), text, "broadcast", null, 0);
             status.setText(failures.isEmpty() ? "Đã phát Broadcast TCP + UDP" : "Broadcast có lỗi: " + String.join("; ", failures));
             refreshDatabaseTable();
