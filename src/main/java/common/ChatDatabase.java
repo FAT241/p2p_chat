@@ -37,8 +37,8 @@ public final class ChatDatabase {
     private static Connection connect() throws SQLException {
         String url = System.getenv().getOrDefault("P2P_DB_URL", "jdbc:postgresql://127.0.0.1:5432/p2p_chat");
         var properties = new Properties();
-        properties.setProperty("user", System.getenv().getOrDefault("P2P_DB_USER", "p2p_chat"));
-        properties.setProperty("password", System.getenv().getOrDefault("P2P_DB_PASSWORD", ""));
+        properties.setProperty("user", System.getenv().getOrDefault("P2P_DB_USER", "postgres"));
+        properties.setProperty("password", System.getenv().getOrDefault("P2P_DB_PASSWORD", "0905786526"));
         properties.setProperty("connectTimeout", "3");
         properties.setProperty("socketTimeout", "5");
         return DriverManager.getConnection(url, properties);
