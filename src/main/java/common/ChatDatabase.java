@@ -20,11 +20,21 @@ public final class ChatDatabase {
 
     private final String owner;
     private final Path legacyFile;
+    private static volatile String dbHost = "127.0.0.1";
 
     private ChatDatabase(String owner, Path legacyFile) {
         this.owner = owner;
         this.legacyFile = legacyFile;
         initialize();
+    }
+
+    /** Đặt IP của máy chạy PostgreSQL (thường là IP server). */
+    public static void setDbHost(String host) {
+        if (host == null || host.isBlank() || "0.0.0.0".equals(host.trim()) || "::".equals(host.trim())) {
+            dbHost = "127.0.0.1";
+        } else {
+            dbHost = host.trim();
+        }
     }
 
     public static ChatDatabase defaultInstance(String scope) {
@@ -35,12 +45,20 @@ public final class ChatDatabase {
     }
 
     private static Connection connect() throws SQLException {
-        String url = System.getenv().getOrDefault("P2P_DB_URL", "jdbc:postgresql://127.0.0.1:5432/p2p_chat");
+        String envUrl = System.getenv("P2P_DB_URL");
+        String url = (envUrl != null && !envUrl.isBlank()) ? envUrl : "jdbc:postgresql://" + dbHost + ":5432/p2p_chat";
+
+        String envUser = System.getenv("P2P_DB_USER");
+        String user = (envUser != null && !envUser.isBlank()) ? envUser : "postgres";
+
+        String envPass = System.getenv("P2P_DB_PASSWORD");
+        String password = (envPass != null && !envPass.isBlank()) ? envPass : "0905786526";
+
         var properties = new Properties();
-        properties.setProperty("user", System.getenv().getOrDefault("P2P_DB_USER", "postgres"));
-        properties.setProperty("password", System.getenv().getOrDefault("P2P_DB_PASSWORD", "0905786526"));
-        properties.setProperty("connectTimeout", "3");
-        properties.setProperty("socketTimeout", "5");
+        properties.setProperty("user", user);
+        properties.setProperty("password", password);
+        properties.setProperty("connectTimeout", "5");
+        properties.setProperty("socketTimeout", "10");
         return DriverManager.getConnection(url, properties);
     }
 

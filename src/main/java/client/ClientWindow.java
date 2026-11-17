@@ -469,6 +469,7 @@ public final class ClientWindow extends JFrame {
         session++;
         int generation = session;
 
+        ChatDatabase.setDbHost(serverHost);
         try { database = ChatDatabase.defaultInstance(name); }
         catch (ChatDatabase.StorageException ex) { status.setText(ex.getMessage()); return; }
         ChatDatabase sessionDatabase = database;
